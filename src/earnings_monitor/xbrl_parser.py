@@ -1,306 +1,338 @@
-"""
-Lightweight XBRL / inline-XBRL parser for NSE integrated financial filings.
-
-Goals:
-- Parse XML and inline-XBRL documents into normalized financial concepts.
-- Prefer quarter-specific facts using contextRef / instant contexts.
-- Fall back gracefully when only partial tagging is available.
-
-This is not a full taxonomy engine, but it is a real XBRL fact extractor.
-"""
 from __future__ import annotations
 
-import io
+import json
 import logging
 import re
-import zipfile
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-from xml.etree import ElementTree as ET
+from typing import Any, Dict, Iterable, List, Optional
+
+from bs4 import BeautifulSoup
+
 
 logger = logging.getLogger(__name__)
 
-XBRL_NAMESPACES = {
-    "xbrli": "http://www.xbrl.org/2003/instance",
-    "ix": "http://www.xbrl.org/2013/inlineXBRL",
-    "link": "http://www.xbrl.org/2003/linkbase",
-}
 
-CONCEPT_ALIASES = {
-    "revenue": [
-        "RevenueFromOperations",
-        "RevenueFromOperationsGross",
-        "RevenueFromOperationsNet",
-        "Revenue",
-        "IncomeFromOperations",
-        "NetSales",
-        "SalesRevenueNet",
-        "TotalRevenueFromOperations",
-        "RevenueFromSaleOfProducts",
-    ],
-    "total_income": [
-        "TotalIncome",
-        "Income",
-        "TotalRevenue",
-        "TotalIncomeFromOperations",
-    ],
-    "pat": [
-        "ProfitLossForPeriod",
-        "ProfitAfterTax",
-        "ProfitForPeriod",
-        "ProfitLossAttributableToOwnersOfParent",
-        "NetProfitLoss",
-        "ProfitAfterTaxForPeriod",
-    ],
-    "pbt": [
-        "ProfitBeforeTax",
-        "ProfitLossBeforeTax",
-    ],
-    "finance_cost": [
-        "FinanceCosts",
-        "FinanceCost",
-    ],
-    "depreciation": [
-        "DepreciationAndAmortisationExpense",
-        "DepreciationAmortisationAndImpairmentExpense",
-        "DepreciationExpense",
-        "AmortisationExpense",
-    ],
-    "tax": [
-        "TaxExpense",
-        "CurrentTax",
-        "IncomeTaxExpense",
-    ],
-    "eps_diluted": [
-        "DilutedEarningsLossPerShare",
-        "DilutedEarningsPerShare",
-        "DilutedEPS",
-    ],
-    "eps_basic": [
-        "BasicEarningsLossPerShare",
-        "BasicEarningsPerShare",
-        "BasicEPS",
-    ],
-    "operating_profit": [
-        "ProfitBeforeFinanceCostsTaxDepreciationAndAmortisationExpense",
-        "OperatingProfit",
-        "ProfitBeforeDepreciationInterestAndTax",
-        "EarningsBeforeInterestTaxDepreciationAndAmortisation",
-        "EBITDA",
-    ],
-    "exceptional_items": [
-        "ExceptionalItems",
-        "ExceptionalItem",
-    ],
-}
+def safe_num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.replace(",", "").replace("\u00a0", " ").strip()
+            if value in {"", "-", "NA", "N/A", "null", "None"}:
+                return default
+            if value.startswith("(") and value.endswith(")"):
+                value = "-" + value[1:-1]
+        return float(value)
+    except Exception:
+        return default
 
 
-@dataclass
-class ContextInfo:
-    context_id: str
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    instant: Optional[str] = None
-
-    @property
-    def is_duration(self) -> bool:
-        return bool(self.start_date and self.end_date)
+def pct_change(current: float, previous: float, default: float = 0.0) -> float:
+    if previous == 0:
+        return default
+    try:
+        return ((current - previous) / abs(previous)) * 100.0
+    except Exception:
+        return default
 
 
-@dataclass
-class Fact:
-    concept: str
-    value: Optional[float]
-    raw_value: str
-    context_ref: Optional[str]
-    unit_ref: Optional[str]
-    decimals: Optional[str]
-    source: str
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
-class XBRLParser:
-    def __init__(self) -> None:
-        self.contexts: Dict[str, ContextInfo] = {}
-        self.facts: List[Fact] = []
+def _contains_any(text: str, keywords: Iterable[str]) -> bool:
+    text = (text or "").lower()
+    return any(k.lower() in text for k in keywords)
 
-    def parse_bytes(self, payload: bytes, source_name: str = "document") -> Dict[str, Optional[float]]:
-        docs = self._expand_payload(payload)
-        for doc_name, doc_bytes in docs:
-            self._parse_document(doc_bytes, source=f"{source_name}:{doc_name}")
-        return self._normalize_metrics()
 
-    def _expand_payload(self, payload: bytes) -> List[Tuple[str, bytes]]:
-        if payload[:2] == b"PK":
-            docs = []
-            with zipfile.ZipFile(io.BytesIO(payload)) as zf:
-                for name in zf.namelist():
-                    lower = name.lower()
-                    if lower.endswith((".xml", ".xhtml", ".html", ".htm", ".xbrl")):
-                        docs.append((name, zf.read(name)))
-            return docs
-        return [("payload", payload)]
+def _pick_first(data: Dict[str, Any], candidates: List[str], default: float = 0.0) -> float:
+    normalized = {_norm(k): v for k, v in data.items()}
+    for candidate in candidates:
+        key = _norm(candidate)
+        if key in normalized:
+            return safe_num(normalized[key], default)
+    return default
 
-    def _parse_document(self, payload: bytes, source: str) -> None:
-        text = payload.decode("utf-8", errors="ignore").strip()
-        if not text:
-            return
-        try:
-            root = ET.fromstring(text)
-        except ET.ParseError:
-            logger.warning("XBRL parse error for %s", source)
-            return
 
-        self._collect_contexts(root)
-        self._collect_standard_facts(root, source)
-        self._collect_inline_facts(root, source)
+def _extract_json_candidates(payload_text: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
 
-    def _collect_contexts(self, root: ET.Element) -> None:
-        for ctx in root.findall('.//{http://www.xbrl.org/2003/instance}context'):
-            ctx_id = ctx.attrib.get('id')
-            if not ctx_id:
+    try:
+        obj = json.loads(payload_text)
+        if isinstance(obj, dict):
+            candidates.append(obj)
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    candidates.append(item)
+    except Exception:
+        pass
+
+    try:
+        soup = BeautifulSoup(payload_text, "html.parser")
+        scripts = soup.find_all("script")
+        for script in scripts:
+            text = script.get_text(" ", strip=True)
+            if not text:
                 continue
-            period = ctx.find('{http://www.xbrl.org/2003/instance}period')
-            start_date = end_date = instant = None
-            if period is not None:
-                sd = period.find('{http://www.xbrl.org/2003/instance}startDate')
-                ed = period.find('{http://www.xbrl.org/2003/instance}endDate')
-                ins = period.find('{http://www.xbrl.org/2003/instance}instant')
-                start_date = sd.text.strip() if sd is not None and sd.text else None
-                end_date = ed.text.strip() if ed is not None and ed.text else None
-                instant = ins.text.strip() if ins is not None and ins.text else None
-            self.contexts[ctx_id] = ContextInfo(ctx_id, start_date, end_date, instant)
-
-    def _collect_standard_facts(self, root: ET.Element, source: str) -> None:
-        for elem in root.iter():
-            if not isinstance(elem.tag, str) or elem.tag.startswith('{http://www.xbrl.org/2013/inlineXBRL}'):
-                continue
-            context_ref = elem.attrib.get('contextRef')
-            if not context_ref:
-                continue
-            concept = self._local_name(elem.tag)
-            raw_value = (elem.text or '').strip()
-            fact = Fact(
-                concept=concept,
-                value=self._coerce_value(raw_value, elem.attrib),
-                raw_value=raw_value,
-                context_ref=context_ref,
-                unit_ref=elem.attrib.get('unitRef'),
-                decimals=elem.attrib.get('decimals'),
-                source=source,
-            )
-            self.facts.append(fact)
-
-    def _collect_inline_facts(self, root: ET.Element, source: str) -> None:
-        for tag in ('nonFraction', 'nonNumeric'):
-            path = f'.//{{http://www.xbrl.org/2013/inlineXBRL}}{tag}'
-            for elem in root.findall(path):
-                name = elem.attrib.get('name', '')
-                if not name:
+            for match in re.findall(r"\{.*?\}", text):
+                try:
+                    obj = json.loads(match)
+                    if isinstance(obj, dict):
+                        candidates.append(obj)
+                except Exception:
                     continue
-                raw_value = ''.join(elem.itertext()).strip()
-                fact = Fact(
-                    concept=self._local_name(name),
-                    value=self._coerce_value(raw_value, elem.attrib),
-                    raw_value=raw_value,
-                    context_ref=elem.attrib.get('contextRef'),
-                    unit_ref=elem.attrib.get('unitRef'),
-                    decimals=elem.attrib.get('decimals'),
-                    source=source,
-                )
-                self.facts.append(fact)
+    except Exception:
+        pass
 
-    def _normalize_metrics(self) -> Dict[str, Optional[float]]:
-        out = {
-            'revenue': self._best_fact_for_aliases(CONCEPT_ALIASES['revenue']),
-            'total_income': self._best_fact_for_aliases(CONCEPT_ALIASES['total_income']),
-            'pat': self._best_fact_for_aliases(CONCEPT_ALIASES['pat']),
-            'pbt': self._best_fact_for_aliases(CONCEPT_ALIASES['pbt']),
-            'finance_cost': self._best_fact_for_aliases(CONCEPT_ALIASES['finance_cost']),
-            'depreciation': self._best_fact_for_aliases(CONCEPT_ALIASES['depreciation']),
-            'tax': self._best_fact_for_aliases(CONCEPT_ALIASES['tax']),
-            'eps_diluted': self._best_fact_for_aliases(CONCEPT_ALIASES['eps_diluted']),
-            'eps_basic': self._best_fact_for_aliases(CONCEPT_ALIASES['eps_basic']),
-            'operating_profit': self._best_fact_for_aliases(CONCEPT_ALIASES['operating_profit']),
-            'exceptional_items': self._best_fact_for_aliases(CONCEPT_ALIASES['exceptional_items']),
-        }
+    return candidates
 
-        if out['operating_profit'] is None:
-            candidates = [out.get('pbt'), out.get('finance_cost'), out.get('depreciation')]
-            if candidates[0] is not None and candidates[1] is not None and candidates[2] is not None:
-                out['operating_profit'] = candidates[0] + candidates[1] + candidates[2]
 
-        if out['revenue'] is None:
-            out['revenue'] = out.get('total_income')
-
-        if out['operating_profit'] is not None and out['revenue'] not in (None, 0):
-            out['ebitda_margin_pct'] = round((out['operating_profit'] / out['revenue']) * 100, 2)
+def _flatten_dict(d: Dict[str, Any], parent: str = "") -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        key = f"{parent}.{k}" if parent else str(k)
+        if isinstance(v, dict):
+            out.update(_flatten_dict(v, key))
         else:
-            out['ebitda_margin_pct'] = None
+            out[key] = v
+    return out
 
-        if out['pat'] is not None and out['revenue'] not in (None, 0):
-            out['pat_margin_pct'] = round((out['pat'] / out['revenue']) * 100, 2)
-        else:
-            out['pat_margin_pct'] = None
 
-        out['xbrl_found'] = any(v is not None for k, v in out.items() if k != 'xbrl_found')
-        return out
+def _extract_inline_xbrl_facts(payload_text: str) -> Dict[str, Any]:
+    facts: Dict[str, Any] = {}
+    soup = BeautifulSoup(payload_text, "xml")
 
-    def _best_fact_for_aliases(self, aliases: List[str]) -> Optional[float]:
-        candidates = []
-        alias_set = {a.lower() for a in aliases}
-        for fact in self.facts:
-            if fact.value is None:
-                continue
-            if fact.concept.lower() in alias_set:
-                score = self._context_score(fact.context_ref)
-                candidates.append((score, fact.value))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
+    for tag_name in ["ix:nonFraction", "ix:nonNumeric", "nonFraction", "nonNumeric"]:
+        for node in soup.find_all(tag_name):
+            name = node.get("name") or node.get("contextRef") or node.name
+            value = node.get_text(" ", strip=True)
+            if name and value:
+                facts[name] = value
 
-    def _context_score(self, context_ref: Optional[str]) -> Tuple[int, int]:
-        ctx = self.contexts.get(context_ref or '')
-        if not ctx:
-            return (0, 0)
-        if ctx.is_duration:
-            try:
-                end = ctx.end_date or ''
-                return (2, int(re.sub(r'\D', '', end) or '0'))
-            except Exception:
-                return (2, 0)
-        if ctx.instant:
-            try:
-                return (1, int(re.sub(r'\D', '', ctx.instant) or '0'))
-            except Exception:
-                return (1, 0)
-        return (0, 0)
+    if facts:
+        return facts
 
-    @staticmethod
-    def _coerce_value(raw: str, attrs: Dict[str, str]) -> Optional[float]:
-        if raw is None:
-            return None
-        s = raw.strip()
-        if not s:
-            return None
-        s = s.replace(',', '').replace('₹', '').replace('%', '')
-        s = s.replace('(', '-').replace(')', '')
-        sign = attrs.get('sign')
-        scale = attrs.get('scale')
-        try:
-            value = float(s)
-            if sign == '-':
-                value = -abs(value)
-            if scale and re.fullmatch(r'-?\d+', scale):
-                value *= 10 ** int(scale)
-            return value
-        except Exception:
-            return None
+    soup = BeautifulSoup(payload_text, "html.parser")
+    for node in soup.find_all():
+        attrs = node.attrs or {}
+        name = attrs.get("name") or attrs.get("data-name") or attrs.get("contextref")
+        if name:
+            value = node.get_text(" ", strip=True)
+            if value:
+                facts[str(name)] = value
 
-    @staticmethod
-    def _local_name(tag: str) -> str:
-        if '}' in tag:
-            return tag.split('}', 1)[1]
-        if ':' in tag:
-            return tag.split(':', 1)[1]
-        return tag
+    return facts
+
+
+def compute_enhanced_metrics(
+    cur: Dict[str, Any],
+    prev_yoy: Optional[Dict[str, Any]] = None,
+    prev_qoq: Optional[Dict[str, Any]] = None,
+    context_text: str = "",
+) -> Dict[str, Any]:
+    revenue_cur = _pick_first(
+        cur,
+        [
+            "revenue",
+            "revenue from operations",
+            "income from operations",
+            "total income",
+            "revenuefromoperations",
+            "incomefromoperations",
+            "revenuefromcontractswithcustomers",
+        ],
+    )
+    revenue_prev_yoy = _pick_first(prev_yoy or {}, ["revenue", "revenue from operations", "total income"])
+    revenue_prev_qoq = _pick_first(prev_qoq or {}, ["revenue", "revenue from operations", "total income"])
+
+    net_profit_cur = _pick_first(
+        cur,
+        [
+            "profit after tax",
+            "net profit",
+            "profit for the period",
+            "profitaftertax",
+            "profitfortheperiod",
+        ],
+    )
+    net_profit_prev_yoy = _pick_first(prev_yoy or {}, ["profit after tax", "net profit", "profit for the period"])
+
+    pbt_cur = _pick_first(
+        cur,
+        [
+            "profit before tax",
+            "profit before tax from continuing operations",
+            "profitbeforetax",
+        ],
+    )
+    pbt_prev_yoy = _pick_first(prev_yoy or {}, ["profit before tax", "profitbeforetax"])
+    pbt_prev_qoq = _pick_first(prev_qoq or {}, ["profit before tax", "profitbeforetax"])
+
+    exceptional_cur = _pick_first(
+        cur,
+        [
+            "exceptional items",
+            "exceptional item",
+            "exceptionalitems",
+        ],
+    )
+    exceptional_prev_yoy = _pick_first(prev_yoy or {}, ["exceptional items", "exceptionalitems"])
+    exceptional_prev_qoq = _pick_first(prev_qoq or {}, ["exceptional items", "exceptionalitems"])
+
+    pbt_before_exc_cur = _pick_first(
+        cur,
+        [
+            "profit before exceptional items and tax",
+            "profit before exceptional items",
+            "profitbeforeexceptionalitemsandtax",
+            "profitbeforeexceptionalitems",
+        ],
+    )
+    pbt_before_exc_prev_yoy = _pick_first(
+        prev_yoy or {},
+        [
+            "profit before exceptional items and tax",
+            "profit before exceptional items",
+            "profitbeforeexceptionalitemsandtax",
+            "profitbeforeexceptionalitems",
+        ],
+    )
+    pbt_before_exc_prev_qoq = _pick_first(
+        prev_qoq or {},
+        [
+            "profit before exceptional items and tax",
+            "profit before exceptional items",
+            "profitbeforeexceptionalitemsandtax",
+            "profitbeforeexceptionalitems",
+        ],
+    )
+
+    normalized_pbt_cur = pbt_before_exc_cur if pbt_before_exc_cur != 0 else (pbt_cur - exceptional_cur)
+    normalized_pbt_prev_yoy = (
+        pbt_before_exc_prev_yoy if pbt_before_exc_prev_yoy != 0 else (pbt_prev_yoy - exceptional_prev_yoy)
+    )
+    normalized_pbt_prev_qoq = (
+        pbt_before_exc_prev_qoq if pbt_before_exc_prev_qoq != 0 else (pbt_prev_qoq - exceptional_prev_qoq)
+    )
+
+    ebitda_cur = _pick_first(
+        cur,
+        [
+            "ebitda",
+            "earnings before interest tax depreciation and amortisation",
+            "profit before depreciation interest and tax",
+            "operating profit",
+        ],
+    )
+    ebitda_prev_yoy = _pick_first(
+        prev_yoy or {},
+        [
+            "ebitda",
+            "earnings before interest tax depreciation and amortisation",
+            "profit before depreciation interest and tax",
+            "operating profit",
+        ],
+    )
+
+    finance_cost_cur = _pick_first(cur, ["finance costs", "finance cost", "interest expense"])
+    finance_cost_prev_yoy = _pick_first(prev_yoy or {}, ["finance costs", "finance cost", "interest expense"])
+
+    tax_expense_cur = _pick_first(cur, ["tax expense", "current tax", "tax"])
+    tax_expense_prev_yoy = _pick_first(prev_yoy or {}, ["tax expense", "current tax", "tax"])
+
+    ebitda_margin_cur = (ebitda_cur / revenue_cur * 100.0) if revenue_cur > 0 else 0.0
+    ebitda_margin_prev_yoy = (ebitda_prev_yoy / revenue_prev_yoy * 100.0) if revenue_prev_yoy > 0 else 0.0
+
+    revenue_yoy = pct_change(revenue_cur, revenue_prev_yoy)
+    qoq_revenue = pct_change(revenue_cur, revenue_prev_qoq)
+    net_profit_yoy = pct_change(net_profit_cur, net_profit_prev_yoy)
+    normalized_pbt_yoy = pct_change(normalized_pbt_cur, normalized_pbt_prev_yoy)
+    qoq_pbt = pct_change(normalized_pbt_cur, normalized_pbt_prev_qoq)
+    finance_cost_yoy = pct_change(finance_cost_cur, finance_cost_prev_yoy)
+
+    tax_rate_cur = ((tax_expense_cur / pbt_cur) * 100.0) if pbt_cur else 0.0
+    tax_rate_prev_yoy = ((tax_expense_prev_yoy / pbt_prev_yoy) * 100.0) if pbt_prev_yoy else 0.0
+    tax_rate_change_pct = tax_rate_cur - tax_rate_prev_yoy
+
+    text = (context_text or "").lower()
+
+    return {
+        "xbrl_found": True,
+        "revenue_current": revenue_cur,
+        "net_profit_current": net_profit_cur,
+        "normalized_pbt_current": normalized_pbt_cur,
+        "revenue_yoy_pct": revenue_yoy,
+        "net_profit_yoy_pct": net_profit_yoy,
+        "normalized_pbt_yoy_pct": normalized_pbt_yoy,
+        "qoq_revenue_pct": qoq_revenue,
+        "qoq_pbt_pct": qoq_pbt,
+        "pbt_vs_revenue_spread_pct": normalized_pbt_yoy - revenue_yoy,
+        "ebitda_margin_current_pct": ebitda_margin_cur,
+        "ebitda_margin_previous_yoy_pct": ebitda_margin_prev_yoy,
+        "ebitda_margin_yoy_bps": (ebitda_margin_cur - ebitda_margin_prev_yoy) * 100.0,
+        "finance_cost_yoy_pct": finance_cost_yoy,
+        "exceptional_items_pct_of_pbt": (abs(exceptional_cur) / abs(pbt_cur) * 100.0) if pbt_cur else 0.0,
+        "tax_rate_change_pct": tax_rate_change_pct,
+        "has_buyback": _contains_any(text, ["buyback"]),
+        "has_bonus": _contains_any(text, ["bonus issue", "bonus shares", "bonus"]),
+        "has_special_dividend": _contains_any(text, ["special dividend"]),
+        "has_revision": _contains_any(text, ["revised", "revision"]),
+        "has_audit_qualification": _contains_any(
+            text,
+            ["audit qualification", "qualified opinion", "emphasis of matter", "adverse opinion"],
+        ),
+    }
+
+
+def parse_xbrl_payload(
+    payload_text: str,
+    previous_year_payload_text: Optional[str] = None,
+    previous_quarter_payload_text: Optional[str] = None,
+    context_text: str = "",
+) -> Dict[str, Any]:
+    if not payload_text:
+        return {"xbrl_found": False}
+
+    current_fact_dicts: List[Dict[str, Any]] = []
+    previous_yoy_fact_dicts: List[Dict[str, Any]] = []
+    previous_qoq_fact_dicts: List[Dict[str, Any]] = []
+
+    inline_current = _extract_inline_xbrl_facts(payload_text)
+    if inline_current:
+        current_fact_dicts.append(inline_current)
+
+    for obj in _extract_json_candidates(payload_text):
+        current_fact_dicts.append(_flatten_dict(obj))
+
+    if previous_year_payload_text:
+        inline_prev_yoy = _extract_inline_xbrl_facts(previous_year_payload_text)
+        if inline_prev_yoy:
+            previous_yoy_fact_dicts.append(inline_prev_yoy)
+        for obj in _extract_json_candidates(previous_year_payload_text):
+            previous_yoy_fact_dicts.append(_flatten_dict(obj))
+
+    if previous_quarter_payload_text:
+        inline_prev_qoq = _extract_inline_xbrl_facts(previous_quarter_payload_text)
+        if inline_prev_qoq:
+            previous_qoq_fact_dicts.append(inline_prev_qoq)
+        for obj in _extract_json_candidates(previous_quarter_payload_text):
+            previous_qoq_fact_dicts.append(_flatten_dict(obj))
+
+    current = max(current_fact_dicts, key=lambda x: len(x), default={})
+    prev_yoy = max(previous_yoy_fact_dicts, key=lambda x: len(x), default={})
+    prev_qoq = max(previous_qoq_fact_dicts, key=lambda x: len(x), default={})
+
+    if not current:
+        logger.warning("No structured facts found in current XBRL payload")
+        return {"xbrl_found": False}
+
+    metrics = compute_enhanced_metrics(
+        cur=current,
+        prev_yoy=prev_yoy,
+        prev_qoq=prev_qoq,
+        context_text=context_text,
+    )
+    metrics["raw_fact_count_current"] = len(current)
+    metrics["raw_fact_count_prev_yoy"] = len(prev_yoy)
+    metrics["raw_fact_count_prev_qoq"] = len(prev_qoq)
+    return metrics
