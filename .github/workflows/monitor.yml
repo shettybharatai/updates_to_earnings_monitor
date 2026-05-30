@@ -1,4 +1,4 @@
-name: NSE Earnings Monitor
+name: Test NSE Earnings Monitor
 
 on:
   workflow_dispatch:
