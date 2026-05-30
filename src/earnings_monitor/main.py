@@ -17,6 +17,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_PARSE_DEBUG_LIMIT = 10
+_parse_debug_count = 0
+
 
 def load_config(path: str = "config.json") -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -54,17 +57,26 @@ def save_state(path: str, data: Dict[str, Any]) -> None:
 
 
 def parse_dt(value: Optional[str]) -> Optional[datetime]:
+    global _parse_debug_count
+
     if not value:
         return None
 
-    value = value.strip()
+    value = str(value).strip()
     patterns = [
         "%d-%b-%Y %H:%M:%S",
         "%d-%b-%Y %H:%M",
         "%d-%m-%Y %H:%M:%S",
         "%d-%m-%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
         "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
         "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d-%b-%Y",
+        "%d-%m-%Y",
+        "%Y-%m-%d",
     ]
 
     for fmt in patterns:
@@ -82,7 +94,13 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
     except Exception:
-        return None
+        pass
+
+    if _parse_debug_count < _PARSE_DEBUG_LIMIT:
+        logger.info("Unparsed datetime sample: raw_value=%r", value)
+        _parse_debug_count += 1
+
+    return None
 
 
 def normalize_symbol(record: Dict[str, Any]) -> str:
@@ -103,15 +121,68 @@ def filing_id(record: Dict[str, Any]) -> str:
     return "|".join(part.strip() for part in parts if part is not None)
 
 
+def extract_timestamp_candidates(record: Dict[str, Any]) -> Dict[str, Any]:
+    candidate_keys = [
+        "broadcastDateTime",
+        "dateTime",
+        "an_dt",
+        "sort_date",
+        "filingDate",
+        "filing_date",
+        "dt",
+        "date",
+        "broadcastdate",
+        "xbrlDateTime",
+        "createdOn",
+        "created_at",
+        "lastUpdateTime",
+        "time",
+    ]
+    found: Dict[str, Any] = {}
+    for key in candidate_keys:
+        if key in record:
+            found[key] = record.get(key)
+    return found
+
+
+def log_timestamp_debug_samples(rows: List[Dict[str, Any]], sample_size: int = 5) -> None:
+    logger.info("Timestamp debug: total rows available=%s", len(rows))
+
+    if not rows:
+        return
+
+    for idx, row in enumerate(rows[:sample_size], start=1):
+        symbol = normalize_symbol(row)
+        ts_fields = extract_timestamp_candidates(row)
+        logger.info(
+            "Timestamp sample %s | symbol=%s | keys=%s",
+            idx,
+            symbol or "UNKNOWN",
+            ts_fields,
+        )
+
+    first_row = rows[0]
+    logger.info("First row keys snapshot: %s", sorted(list(first_row.keys())))
+
+
 def is_recent(record: Dict[str, Any], minutes: int) -> Optional[bool]:
-    dt = parse_dt(
+    raw_ts = (
         record.get("broadcastDateTime")
         or record.get("dateTime")
         or record.get("an_dt")
         or record.get("sort_date")
+        or record.get("filingDate")
+        or record.get("filing_date")
+        or record.get("dt")
+        or record.get("date")
+        or record.get("createdOn")
+        or record.get("lastUpdateTime")
     )
+
+    dt = parse_dt(raw_ts)
     if not dt:
         return None
+
     now = datetime.now(timezone.utc)
     return dt >= now - timedelta(minutes=minutes)
 
@@ -135,6 +206,8 @@ def main() -> None:
 
     raw_results = fetch_latest_results(config)
     logger.info("Received %s records from NSE", len(raw_results))
+
+    log_timestamp_debug_samples(raw_results, sample_size=5)
 
     recent_rows: List[Dict[str, Any]] = []
     old_rows = 0
