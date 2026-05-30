@@ -2,16 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-import requests
-
 from src.earnings_monitor.nse_source import fetch_latest_results
 from src.earnings_monitor.notifier import send_telegram_message
-from src.earnings_monitor.scoring import score_result
-from src.earnings_monitor.xbrl_parser import parse_xbrl_payload
 
 
 logging.basicConfig(
@@ -23,7 +20,11 @@ logger = logging.getLogger(__name__)
 
 def load_config(path: str = "config.json") -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+
+    config["TELEGRAM_BOT_TOKEN"] = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    config["TELEGRAM_CHAT_ID"] = os.getenv("TELEGRAM_CHAT_ID", "")
+    return config
 
 
 def load_watchlist(path: str) -> Set[str]:
@@ -31,11 +32,6 @@ def load_watchlist(path: str) -> Set[str]:
     if not p.exists():
         logger.warning("Watchlist file not found: %s", path)
         return set()
-
-    if p.suffix.lower() == ".json":
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return {str(x).strip().upper() for x in data if str(x).strip()}
 
     with open(p, "r", encoding="utf-8") as f:
         lines = [line.strip() for line in f if line.strip()]
@@ -107,35 +103,6 @@ def filing_id(record: Dict[str, Any]) -> str:
     return "|".join(part.strip() for part in parts if part is not None)
 
 
-def fetch_text(url: str, timeout: int = 30) -> str:
-    if not url:
-        return ""
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
-        "Referer": "https://www.nseindia.com/",
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        return resp.text
-    except Exception as exc:
-        logger.warning("Failed to fetch %s: %s", url, exc)
-        return ""
-
-
-def collect_context_text(record: Dict[str, Any]) -> str:
-    pieces = [
-        str(record.get("subject") or ""),
-        str(record.get("headline") or ""),
-        str(record.get("desc") or ""),
-        str(record.get("remarks") or ""),
-        str(record.get("bmDesc") or ""),
-        str(record.get("companyName") or ""),
-    ]
-    return " | ".join(x for x in pieces if x)
-
-
 def is_recent(record: Dict[str, Any], minutes: int) -> Optional[bool]:
     dt = parse_dt(
         record.get("broadcastDateTime")
@@ -149,56 +116,18 @@ def is_recent(record: Dict[str, Any], minutes: int) -> Optional[bool]:
     return dt >= now - timedelta(minutes=minutes)
 
 
-def fetch_historical_payloads(record: Dict[str, Any]) -> Dict[str, str]:
-    return {
-        "previous_year_payload_text": "",
-        "previous_quarter_payload_text": "",
-    }
-
-
-def build_alert_message(
-    parsed: Dict[str, Any],
-    result: Dict[str, Any],
-    record: Dict[str, Any],
-) -> str:
-    symbol = parsed.get("symbol") or normalize_symbol(record) or "UNKNOWN"
-    company_name = parsed.get("company_name") or record.get("companyName") or symbol
-    reasons = result.get("reasons", [])
-    penalties = result.get("penalties", [])
-
-    lines = [
-        f"📊 {company_name} ({symbol})",
-        f"Classification: {result['classification'].replace('_', ' ').title()}",
-        f"Score: {result['score']}",
-        f"Core signals: {result.get('core_signals', 0)}",
-        "",
-        "Why it qualified:",
-    ]
-    lines.extend([f"- {r}" for r in reasons[:6]])
-
-    if penalties:
-        lines.extend(["", "Cautions:"])
-        lines.extend([f"- {p}" for p in penalties[:3]])
-
-    source_url = (
-        record.get("xbrl")
-        or record.get("attachment")
-        or record.get("attchmntFile")
-        or record.get("pdfUrl")
-        or ""
-    )
-    if source_url:
-        lines.extend(["", f"Source: {source_url}"])
-
-    return "\n".join(lines)
+def build_test_message(record: Dict[str, Any]) -> str:
+    symbol = normalize_symbol(record) or "UNKNOWN"
+    company_name = record.get("companyName") or symbol
+    subject = record.get("subject") or record.get("headline") or "Result filing detected"
+    return f"Test repo detected filing:\n{company_name} ({symbol})\n{subject}"
 
 
 def main() -> None:
     config = load_config()
-    thresholds = config["thresholds"]
     recent_window_minutes = int(config.get("recent_results_window_minutes", 10))
 
-    watchlist = load_watchlist(config["watchlist_file"])
+    watchlist = load_watchlist(config.get("watchlist_file", "data/watchlist.txt"))
     logger.info("Watchlist loaded: %s symbols", len(watchlist))
 
     state = load_state(config["state_file"])
@@ -239,42 +168,10 @@ def main() -> None:
 
     for row in new_results:
         fid = filing_id(row)
-        symbol = normalize_symbol(row)
-
-        xbrl_url = row.get("xbrl") or row.get("xbrlUrl") or row.get("xmlUrl") or ""
-        attachment_url = row.get("attachment") or row.get("attchmntFile") or row.get("pdfUrl") or ""
-        primary_url = xbrl_url or attachment_url
-
-        payload_text = fetch_text(primary_url) if primary_url else ""
-        historical = fetch_historical_payloads(row)
-        context_text = collect_context_text(row)
-
-        parsed = parse_xbrl_payload(
-            payload_text=payload_text,
-            previous_year_payload_text=historical.get("previous_year_payload_text"),
-            previous_quarter_payload_text=historical.get("previous_quarter_payload_text"),
-            context_text=context_text,
-        )
-
-        parsed["symbol"] = symbol
-        parsed["company_name"] = row.get("companyName") or symbol
-
-        result = score_result(parsed, thresholds)
-
-        logger.info(
-            "Scored %s | classification=%s score=%s xbrl_found=%s",
-            symbol,
-            result["classification"],
-            result["score"],
-            parsed.get("xbrl_found"),
-        )
-
-        if result["alert"]:
-            message = build_alert_message(parsed, result, row)
-            send_telegram_message(config, message)
-            alert_count += 1
-
+        message = build_test_message(row)
+        send_telegram_message(config, message)
         processed.add(fid)
+        alert_count += 1
 
     logger.info(
         "Run complete. raw_rows=%s recent_rows=%s old_rows=%s unparsable_rows=%s watchlist_rows=%s new_results=%s alerts_sent=%s",
