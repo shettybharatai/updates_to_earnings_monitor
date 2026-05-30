@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -40,7 +39,6 @@ def _get_json(session: requests.Session, url: str, config: Dict[str, Any]) -> An
     _warmup_session(session, config)
     resp = session.get(url, timeout=30)
     resp.raise_for_status()
-
     try:
         return resp.json()
     except Exception:
