@@ -1,35 +1,41 @@
-﻿import os
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict
+
 import requests
 
-def send_telegram(message: str) -> bool:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat_id:
-        return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-    try:
-        resp = requests.post(url, json=payload, timeout=30)
-        return resp.ok
-    except Exception:
+
+logger = logging.getLogger(__name__)
+
+
+def send_telegram_message(config: Dict[str, Any], message: str) -> bool:
+    bot_token = (
+        config.get("telegram_bot_token")
+        or config.get("TELEGRAM_BOT_TOKEN")
+        or config.get("bot_token")
+    )
+    chat_id = (
+        config.get("telegram_chat_id")
+        or config.get("TELEGRAM_CHAT_ID")
+        or config.get("chat_id")
+    )
+
+    if not bot_token or not chat_id:
+        logger.warning("Telegram bot token or chat id missing in config")
         return False
 
-def build_message(item: dict, scored: dict) -> str:
-    emoji = "ðŸš€" if scored["classification"] == "very_exceptional" else "â­"
-    lines = [
-        f"{emoji} <b>{item.get('company_name', item.get('symbol', 'Unknown'))}</b> â€” {scored['classification'].replace('_', ' ').title()}",
-        f"<b>Symbol:</b> {item.get('symbol', 'NA')}",
-        f"<b>Quarter:</b> {item.get('quarter_label', item.get('period_end', 'NA'))}",
-        f"<b>Basis:</b> {item.get('basis', 'NA')}",
-        f"<b>Filing time:</b> {item.get('filing_time', 'NA')}",
-        f"<b>Score:</b> {scored['score']}"
-    ]
-    if scored["reasons"]:
-        lines.append("\n<b>What qualified:</b>")
-        lines += [f"  â€¢ {r}" for r in scored["reasons"]]
-    if scored["penalties"]:
-        lines.append("\n<b>Penalties applied:</b>")
-        lines += [f"  âš  {p}" for p in scored["penalties"]]
-    if item.get("source_url"):
-        lines.append(f"\n<a href='{item['source_url']}'>View Filing</a>")
-    return "\n".join(lines)
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "disable_web_page_preview": True,
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        return True
+    except Exception as exc:
+        logger.warning("Failed to send Telegram message: %s", exc)
+        return False
