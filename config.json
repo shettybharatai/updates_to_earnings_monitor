@@ -4,19 +4,39 @@
   "nse_past_results_api": "https://www.nseindia.com/api/results-comparision?symbol=",
   "nse_base_url": "https://www.nseindia.com",
   "integrated_filing_url": "https://www.nseindia.com/companies-listing/corporate-integrated-filing",
-  "xbrl_lookup_keys": ["xbrlAttachment", "xbrl", "attchmntFile"],
+  "xbrl_lookup_keys": [
+    "xbrlAttachment",
+    "xbrl",
+    "attchmntFile"
+  ],
   "state_file": "state/processed_filings.json",
   "allow_standalone_if_no_consolidated": true,
   "recent_results_window_minutes": 10,
   "history_quarters": 8,
+  "watchlist_file": "data/watchlist.txt",
   "thresholds": {
-    "revenue_yoy_pct": 20,
-    "pat_yoy_pct": 25,
-    "ebitda_margin_bps": 150,
-    "eps_yoy_pct": 25,
-    "revenue_vs_median_pct": 15,
-    "pat_vs_median_pct": 15,
-    "min_score_exceptional": 5,
-    "min_score_very_exceptional": 7
+    "min_score_good": 4,
+    "min_score_exceptional": 7,
+    "min_score_very_exceptional": 10,
+
+    "revenue_yoy_min_pct": 0,
+    "revenue_yoy_good_pct": 12,
+    "revenue_yoy_very_strong_pct": 20,
+
+    "net_profit_yoy_good_pct": 20,
+    "normalized_pbt_yoy_good_pct": 20,
+    "pbt_vs_revenue_spread_good_pct": 5,
+
+    "ebitda_margin_expand_good_bps": 250,
+
+    "qoq_revenue_good_pct": 8,
+    "qoq_pbt_good_pct": 10,
+
+    "finance_cost_decline_good_pct": -20,
+
+    "exceptional_items_penalty_pct": 20,
+    "exceptional_items_blocker_pct": 35,
+
+    "tax_rate_change_penalty_pct": 15
   }
 }
