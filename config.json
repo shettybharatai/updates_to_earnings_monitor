@@ -1,0 +1,22 @@
+{
+  "nifty200_csv_url": "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv",
+  "nse_results_api": "https://www.nseindia.com/api/corporates-financial-results?index=equities&period=Quarterly",
+  "nse_past_results_api": "https://www.nseindia.com/api/results-comparision?symbol=",
+  "nse_base_url": "https://www.nseindia.com",
+  "integrated_filing_url": "https://www.nseindia.com/companies-listing/corporate-integrated-filing",
+  "xbrl_lookup_keys": ["xbrlAttachment", "xbrl", "attchmntFile"],
+  "state_file": "state/processed_filings.json",
+  "allow_standalone_if_no_consolidated": true,
+  "recent_results_window_minutes": 10,
+  "history_quarters": 8,
+  "thresholds": {
+    "revenue_yoy_pct": 20,
+    "pat_yoy_pct": 25,
+    "ebitda_margin_bps": 150,
+    "eps_yoy_pct": 25,
+    "revenue_vs_median_pct": 15,
+    "pat_vs_median_pct": 15,
+    "min_score_exceptional": 5,
+    "min_score_very_exceptional": 7
+  }
+}
